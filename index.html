@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>InnoDB 改良版冷热隔离 LRU 模拟器</title>
+    <style>
+        :root {
+            --bg: #f5f7fa;
+            --young-bg: #fff5f5;
+            --young-border: #fc8181;
+            --old-bg: #ebf8ff;
+            --old-border: #63b3ed;
+            --midpoint: #e53e3e;
+            --text-color: #2d3748;
+        }
+        body { font-family: -apple-system, sans-serif; background: var(--bg); display: flex; flex-direction: column; align-items: center; padding: 20px; color: var(--text-color); }
+        .container { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); width: 800px; display: flex; gap: 30px; }
+        
+        /* 左侧控制区 */
+        .control-panel { flex: 1; display: flex; flex-direction: column; gap: 15px; }
+        .control-panel button { padding: 12px; border: none; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; transition: 0.2s; color: white; display: flex; align-items: center; gap: 8px; }
+        .btn-load { background: #3182ce; }
+        .btn-fast { background: #d69e2e; }
+        .btn-promote { background: #38a169; }
+        .control-panel button:hover { opacity: 0.85; transform: translateY(-2px); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        
+        .log-box { flex-grow: 1; background: #1a202c; color: #48bb78; padding: 15px; border-radius: 8px; font-family: monospace; font-size: 14px; overflow-y: auto; max-height: 400px; box-shadow: inset 0 2px 4px rgba(0,0,0,0.5); }
+        .log-warn { color: #ecc94b; }
+        .log-danger { color: #fc8181; }
+
+        /* 右侧链表区 */
+        .lru-panel { width: 300px; display: flex; flex-direction: column; gap: 5px; position: relative; }
+        
+        .zone { border-radius: 8px; padding: 10px; border: 2px dashed; position: relative; display: flex; flex-direction: column; gap: 8px; }
+        .zone-young { background: var(--young-bg); border-color: var(--young-border); }
+        .zone-old { background: var(--old-bg); border-color: var(--old-border); }
+        
+        .zone-title { position: absolute; right: -120px; top: 50%; transform: translateY(-50%); font-weight: bold; font-size: 14px; color: #718096; width: 100px; }
+        
+        .midpoint-divider { height: 4px; background: var(--midpoint); margin: 5px 0; position: relative; display: flex; align-items: center; justify-content: center; }
+        .midpoint-label { background: var(--midpoint); color: white; font-size: 12px; font-weight: bold; padding: 2px 8px; border-radius: 12px; position: absolute; left: -140px; }
+
+        .page-block { background: white; border: 2px solid #cbd5e0; padding: 12px; border-radius: 6px; text-align: center; font-weight: bold; transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        
+        /* 动画状态类 */
+        .highlight-new { background: #bee3f8; border-color: #3182ce; transform: scale(1.05); }
+        .highlight-warn { background: #fefcbf; border-color: #d69e2e; transform: translateX(10px); }
+        .highlight-promote { background: #c6f6d5; border-color: #38a169; transform: scale(1.05); box-shadow: 0 0 15px rgba(56,161,105,0.4); }
+        .highlight-demote { background: #fed7d7; border-color: #fc8181; opacity: 0.8; }
+        
+        .head-tail-label { font-size: 12px; color: #a0aec0; text-align: center; font-weight: bold; margin: 2px 0; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="control-panel">
+        <h2 style="margin-top:0;">MySQL 冷热隔离 LRU 调度器</h2>
+        <p style="font-size: 14px; color: #718096; line-height: 1.5;">防缓存污染铁律：新数据一律插进 Old 区头部 (Midpoint)。熬过 1 秒后再次访问，才能晋升 Young 区！</p>
+        
+        <button class="btn-load" onclick="loadNewPage()">📥 加载新数据页 (触发磁盘I/O)</button>
+        <button class="btn-fast" onclick="fastRevisit()">⚡ 极速复访 Old 头节点 (&lt; 1秒)</button>
+        <button class="btn-promote" onclick="delayedRevisit()">🔥 延迟复访 Old 某节点 (&gt; 1秒)</button>
+
+        <div class="log-box" id="log-console">
+            [系统初始化] 8个初始数据页已就位。<br>
+        </div>
+    </div>
+
+    <div class="lru-panel" id="lru-container">
+        <div class="head-tail-label">⬆️ LRU Head (最热)</div>
+        
+        <div class="zone zone-young" id="young-zone">
+            <div class="zone-title" style="color: #c53030;">🔥 Young 区<br>(5/8 绝对热点)</div>
+            </div>
+
+        <div class="midpoint-divider">
+            <div class="midpoint-label">⬅️ Midpoint (新数据插这)</div>
+        </div>
+
+        <div class="zone zone-old" id="old-zone">
+            <div class="zone-title" style="color: #2b6cb0;">❄️ Old 区<br>(3/8 考察冷宫)</div>
+            </div>
+
+        <div class="head-tail-label">⬇️ LRU Tail (准备淘汰)</div>
+    </div>
+</div>
+
+<script>
+    // 初始状态：5个Young，3个Old
+    let youngList = ['页 P1', '页 P2', '页 P3', '页 P4', '页 P5'];
+    let oldList = ['页 P6', '页 P7', '页 P8'];
+    let pageCounter = 8;
+    
+    // 记录动画高亮的节点
+    let highlightTarget = null;
+    let highlightType = ''; // 'new', 'warn', 'promote', 'demote'
+
+    function log(msg, type = '') {
+        const consoleEl = document.getElementById('log-console');
+        let colorClass = '';
+        if (type === 'warn') colorClass = 'log-warn';
+        if (type === 'danger') colorClass = 'log-danger';
+        consoleEl.innerHTML += `<span class="${colorClass}">> ${msg}</span><br>`;
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+
+    function renderLRU() {
+        const youngZone = document.getElementById('young-zone');
+        const oldZone = document.getElementById('old-zone');
+        
+        // 渲染 Young
+        youngZone.innerHTML = '<div class="zone-title" style="color: #c53030;">🔥 Young 区<br>(5/8 绝对热点)</div>';
+        youngList.forEach(val => {
+            let className = 'page-block';
+            if (val === highlightTarget) {
+                if (highlightType === 'promote') className += ' highlight-promote';
+            }
+            youngZone.innerHTML += `<div class="${className}">${val}</div>`;
+        });
+
+        // 渲染 Old
+        oldZone.innerHTML = '<div class="zone-title" style="color: #2b6cb0;">❄️ Old 区<br>(3/8 考察冷宫)</div>';
+        oldList.forEach(val => {
+            let className = 'page-block';
+            if (val === highlightTarget) {
+                if (highlightType === 'new') className += ' highlight-new';
+                if (highlightType === 'warn') className += ' highlight-warn';
+                if (highlightType === 'demote') className += ' highlight-demote';
+            }
+            oldZone.innerHTML += `<div class="${className}">${val}</div>`;
+        });
+        
+        // 清理高亮状态，等待下一次点击
+        setTimeout(() => { highlightTarget = null; highlightType = ''; }, 600);
+    }
+
+    function loadNewPage() {
+        pageCounter++;
+        const newPage = `页 P${pageCounter}`;
+        
+        // 核心铁律：插入 Old 头部，踢出 Old 尾部。Young 纹丝不动。
+        const evicted = oldList.pop();
+        oldList.unshift(newPage);
+        
+        highlightTarget = newPage;
+        highlightType = 'new';
+        
+        log(`[磁盘读取] 加载 ${newPage}。严格拦截！插至 Old 区头部。`, 'warn');
+        log(`[缓冲池满] 最冷数据 ${evicted} 被踢出内存！`, 'danger');
+        renderLRU();
+    }
+
+    function fastRevisit() {
+        const target = oldList[0]; // 模拟全表扫描刚加载就立刻访问
+        highlightTarget = target;
+        highlightType = 'warn';
+        
+        log(`[极速连访] ${target} 访问间隔 < 1秒。判定为全表扫描伪热点，拒绝晋升！`, 'danger');
+        renderLRU();
+    }
+
+    function delayedRevisit() {
+        // 模拟熬过1秒后的真实请求，随机挑一个 Old 区的节点
+        const targetIndex = Math.floor(Math.random() * oldList.length);
+        const target = oldList[targetIndex];
+        
+        // 核心跃迁逻辑
+        oldList.splice(targetIndex, 1); // 从 Old 区摘除
+        const demoted = youngList.pop(); // Young 区最底部的可怜虫掉下来
+        
+        youngList.unshift(target); // 飞升至 Young 头部
+        oldList.unshift(demoted);  // 降级至 Old 头部
+
+        highlightTarget = target;
+        highlightType = 'promote';
+        
+        log(`[真实复访] ${target} 熬过1秒考察期，被确认为真热点！飞升至 Young 区头部！`);
+        log(`[链条挤压] 原 Young 区底部 ${demoted} 被迫降级至 Old 区头部。`, 'warn');
+        renderLRU();
+    }
+
+    // 初始渲染
+    renderLRU();
+</script>
+</body>
+</html>
